@@ -28,6 +28,30 @@ datasets_dict = {
 splits = ["train", "val", "test"]
 
 
+def compute_metrics(ranks):
+    r1 = 100.0 * len(np.where(ranks < 1)[0]) / len(ranks)
+    r5 = 100.0 * len(np.where(ranks < 5)[0]) / len(ranks)
+    r10 = 100.0 * len(np.where(ranks < 10)[0]) / len(ranks)
+    medr = np.floor(np.median(ranks)) + 1
+    meanr = ranks.mean() + 1
+    return (r1, r5, r10, medr, meanr)
+
+
+def t2i(images, captions):
+    """
+    Text->Images (Image Search)
+    """
+
+    ranks = np.zeros(len(images))
+    for index in tqdm(range(len(captions))):
+        query = captions[index]
+        # Compute scores
+        ranks_all = np.argsort(np.dot(query, images.T))[::-1]
+        ranks[index] = np.where(ranks_all == index)[0][0]
+
+    return compute_metrics(ranks)
+
+
 def compute_embeddings(img_model, text_model, dataloader, batch_size):
     img_embeddings = np.zeros((len(dataloader.dataset), 256), dtype=np.float)
     text_embeddings = np.zeros((len(dataloader.dataset), 256), dtype=np.float)
@@ -288,7 +312,11 @@ def main():
     if args.eval:
         img_model.load_state_dict(torch.load(best_model_img))
         text_model.load_state_dict(torch.load(best_model_text))
-        embeddings = compute_embeddings(img_model, text_model, test_dataloader, batch_size_eval)
+        embeddings_img, embeddings_cap = compute_embeddings(img_model, text_model, test_dataloader, batch_size_eval)
+        recall = t2i(embeddings_img, embeddings_cap)
+        avg_recall = (recall[0] + recall[1] + recall[2]) / 3
+        print("Average t2i Recall: %.1f" % avg_recall)
+        print("Text to image: %.1f %.1f %.1f %.1f %.1f" % recall)
 
 
 if __name__ == '__main__':
