@@ -85,7 +85,7 @@ def set_seed(seed):
 
 
 class MyDataset(torch.utils.data.Dataset):
-    def __init__(self, split, dataset_name):
+    def __init__(self, split, dataset_name, use_roberta_embeddings):
         super().__init__()
         if dataset_name not in datasets_dict:
             raise Exception(
@@ -94,26 +94,30 @@ class MyDataset(torch.utils.data.Dataset):
             raise Exception(
                 f"{split} not correct. \nChoose one of {splits}.")
         dataset_dict = datasets_dict[dataset_name]
-        doc2vec_df = pd.read_pickle(os.path.join(dataset_dict["data_dir"], "doc2vec",
-                                                 f"doc2vec_{dataset_dict['jsonl_prefix']}_{split}.pkl"))
-        self.article_vectors = np.array(doc2vec_df[2].tolist())
-        doc2vec_df["index"] = list(range(len(doc2vec_df)))
-        doc2vec_df = doc2vec_df[["index", 1]].explode(1)
-        doc2vec_df["index"] = doc2vec_df["index"].astype("category")
-        doc2vec_df[1] = doc2vec_df[1].astype("category")
+
+        if use_roberta_embeddings:
+            df_path = os.path.join(dataset_dict["data_dir"],
+                                   f"roberta_{dataset_dict['jsonl_prefix']}_{split}.pkl")
+        else:
+            df_path = os.path.join(dataset_dict["data_dir"], "doc2vec",
+                                   f"doc2vec_{dataset_dict['jsonl_prefix']}_{split}.pkl")
+        article_emb_df = pd.read_pickle(df_path)
+        self.article_vectors = np.array(article_emb_df[3].tolist())
+        article_emb_df["index"] = list(range(len(article_emb_df)))
+        article_emb_df = article_emb_df[["index", 1]].explode(1)
+        article_emb_df[1] = article_emb_df[1].astype("category")
         image_df = pd.DataFrame(pd.read_pickle(os.path.join(dataset_dict["data_dir"],
                                                             f"{image_features_model}_{dataset_dict['jsonl_prefix']}_{split}.pkl"))).T
-        self.id_df = pd.merge(doc2vec_df.rename(columns={1: "path"}),
+        self.id_df = pd.merge(article_emb_df.rename(columns={1: "path"}),
                               image_df.reset_index().reset_index()[["level_0", "index"]],
-                              left_on="path", right_on="index").drop(columns=["index_y"])
+                              left_on="path", right_on="index").drop(columns=["index_y", "path"]).values
         self.image_vectors = image_df.values
 
     def __len__(self):
         return len(self.id_df)
 
     def __getitem__(self, index):
-        entry = self.id_df.iloc[index]
-        return self.image_vectors[entry["level_0"]], self.article_vectors[entry["index_x"]]
+        return self.image_vectors[self.id_df[index, 1]], self.article_vectors[self.id_df[index, 0]]
 
 
 class ImageProjectModel(torch.nn.Module):
@@ -130,11 +134,11 @@ class ImageProjectModel(torch.nn.Module):
 
 
 class TextProjectModel(torch.nn.Module):
-    def __init__(self):
+    def __init__(self, input_size):
         super().__init__()
         self.activation = torch.nn.SELU()
         self.dropout = torch.nn.Dropout(p=0.1)
-        self.projector_1 = torch.nn.Linear(512, 512)
+        self.projector_1 = torch.nn.Linear(input_size, 512)
         self.projector_2 = torch.nn.Linear(512, 256)
 
     def forward(self, input):
@@ -170,7 +174,8 @@ class TripletLoss(torch.nn.Module):
 
         # compare every diagonal score to scores in its column
         # caption retrieval
-        cost_s = (self.margin + scores - d1).clamp(min=0)
+        if self.i2t:
+            cost_s = (self.margin + scores - d1).clamp(min=0)
         # compare every diagonal score to scores in its row
         # image retrieval
         cost_im = (self.margin + scores - d2).clamp(min=0)
@@ -179,12 +184,14 @@ class TripletLoss(torch.nn.Module):
         I = torch.eye(scores.size(0)) > .5
         if torch.cuda.is_available():
             I = I.cuda()
-        cost_s = cost_s.masked_fill_(I, 0)
+        if self.i2t:
+            cost_s = cost_s.masked_fill_(I, 0)
         cost_im = cost_im.masked_fill_(I, 0)
 
         # keep the maximum violating negative for each query
         if self.max_violation:
-            cost_s = cost_s.max(1)[0]
+            if self.i2t:
+                cost_s = cost_s.max(1)[0]
             cost_im = cost_im.max(0)[0]
 
         loss = cost_im.sum()
@@ -197,11 +204,11 @@ class TripletLoss(torch.nn.Module):
 def main():
     parser = argparse.ArgumentParser()
 
-    # Required parameter
     parser.add_argument("--output_dir", default="output", type=str,
                         help="The output directory where the model predictions and checkpoints "
                              "will be written.")
 
+    parser.add_argument("--bert_embeddings", action='store_true', help="Whether to use roberta embeddings.")
     parser.add_argument("--train", action='store_true', help="Whether to run training.")
     parser.add_argument("--eval", action='store_true',
                         help="Whether to run eval on the test set.")
@@ -210,7 +217,8 @@ def main():
                         help="The initial learning rate for Adam.")
     parser.add_argument("--weight_decay", default=1e-5, type=float,
                         help="Weight deay if we apply some.")
-    parser.add_argument("--num_epochs", default=100, type=int,
+    parser.add_argument("--dataloader_workers", default=16, type=int)
+    parser.add_argument("--num_epochs", default=40, type=int,
                         help="Total number of training epochs to perform.")
     parser.add_argument("--seed", type=int, default=42, help="random seed for initialization")
     parser.add_argument("--batch_size", default=128, type=int, help="Batch size per GPU/CPU.")
@@ -241,15 +249,16 @@ def main():
     batch_size = args.batch_size * max(1, n_gpu)
     batch_size_eval = args.batch_size * max(1, n_gpu)
 
-    test_dataloader = torch.utils.data.DataLoader(dataset=MyDataset('val', args.dataset_name),
+    test_dataloader = torch.utils.data.DataLoader(dataset=MyDataset('val', args.dataset_name, args.bert_embeddings),
                                                   batch_size=batch_size_eval, shuffle=False,
                                                   num_workers=4)
+    input_size = 768 if args.bert_embeddings else 512
     img_model = torch.nn.DataParallel(ImageProjectModel()).cuda()
-    text_model = torch.nn.DataParallel(TextProjectModel()).cuda()
+    text_model = torch.nn.DataParallel(TextProjectModel(input_size)).cuda()
     if args.train:
         train_dataloader = torch.utils.data.DataLoader(
-            dataset=MyDataset('train', args.dataset_name),
-            batch_size=batch_size, shuffle=True, num_workers=32)
+            dataset=MyDataset('train', args.dataset_name, args.bert_embeddings),
+            batch_size=batch_size, shuffle=True, num_workers=args.dataloader_workers)
 
         optimizer = torch.optim.Adam(
             params=itertools.chain(img_model.parameters(), text_model.parameters()),
@@ -290,7 +299,6 @@ def main():
                         article_projections = text_model(articles.float().cuda())
                         loss = triplet_loss(image_projections, article_projections)
 
-                    pbar.update()
                     losses.append(loss.item() / max(
                         (len(image_projections) * len(article_projections) - len(image_projections)),
                         1))
@@ -317,6 +325,12 @@ def main():
         avg_recall = (recall[0] + recall[1] + recall[2]) / 3
         print("Average t2i Recall: %.1f" % avg_recall)
         print("Text to image: %.1f %.1f %.1f %.1f %.1f" % recall)
+        mlflow.log_metric("R1", recall[0])
+        mlflow.log_metric("R5", recall[1])
+        mlflow.log_metric("R10", recall[2])
+        mlflow.log_metric("MdR", recall[3])
+        mlflow.log_metric("MeR", recall[4])
+
 
 
 if __name__ == '__main__':
