@@ -8,6 +8,7 @@ from tqdm import tqdm
 import csv, itertools
 import pandas as pd
 import mlflow
+from transformers import LongformerModel
 
 csv.field_size_limit(sys.maxsize)
 
@@ -59,10 +60,10 @@ def compute_embeddings(img_model, text_model, dataloader, batch_size):
     text_model.eval()
 
     with tqdm(total=len(dataloader), ascii=True, leave=False, desc='iter') as pbar:
-        for i, (images, articles) in enumerate(dataloader):
+        for i, (images, articles_ids, articles_mask) in enumerate(dataloader):
             with torch.no_grad():
                 image_projections = img_model(images.float().cuda())
-                article_projections = text_model(articles.float().cuda())
+                article_projections = text_model(articles_ids.cuda(), articles_mask.cuda())
 
             img_embeddings[i * batch_size: i * batch_size + len(image_projections)] = image_projections.cpu().numpy()
             text_embeddings[i * batch_size: i * batch_size + len(article_projections)] = article_projections.cpu().numpy()
@@ -97,12 +98,12 @@ class MyDataset(torch.utils.data.Dataset):
 
         if use_roberta_embeddings:
             df_path = os.path.join(dataset_dict["data_dir"],
-                                   f"roberta_{dataset_dict['jsonl_prefix']}_{split}.pkl")
+                                   f"longformer_tokens_{dataset_dict['jsonl_prefix']}_{split}.pkl")
         else:
             df_path = os.path.join(dataset_dict["data_dir"], "doc2vec",
                                    f"doc2vec_{dataset_dict['jsonl_prefix']}_{split}.pkl")
         article_emb_df = pd.read_pickle(df_path)
-        self.article_vectors = np.array(article_emb_df[3].tolist())
+        self.article_vectors = np.array(article_emb_df[2].tolist())
         article_emb_df["index"] = list(range(len(article_emb_df)))
         article_emb_df = article_emb_df[["index", 1]].explode(1)
         article_emb_df[1] = article_emb_df[1].astype("category")
@@ -117,7 +118,8 @@ class MyDataset(torch.utils.data.Dataset):
         return len(self.id_df)
 
     def __getitem__(self, index):
-        return self.image_vectors[self.id_df[index, 1]], self.article_vectors[self.id_df[index, 0]]
+        return self.image_vectors[self.id_df[index, 1]], \
+               self.article_vectors[self.id_df[index, 0], 0], self.article_vectors[self.id_df[index, 0], 1]
 
 
 class ImageProjectModel(torch.nn.Module):
@@ -140,9 +142,16 @@ class TextProjectModel(torch.nn.Module):
         self.dropout = torch.nn.Dropout(p=0.1)
         self.projector_1 = torch.nn.Linear(input_size, 512)
         self.projector_2 = torch.nn.Linear(512, 256)
+        self.text_model = LongformerModel.from_pretrained("allenai/longformer-base-4096")
+        fine_tune_layers = 3
+        for i, (name, param) in enumerate(self.text_model.named_parameters()):
+            if i == (12 - fine_tune_layers) * 22 + 5:
+                break
+            param.requires_grad = False
 
-    def forward(self, input):
-        out = self.projector_2(self.dropout(self.activation(self.projector_1(input))))
+    def forward(self, input_tokens, attention_mask):
+        out = torch.mean(self.text_model(input_ids=input_tokens, attention_mask=attention_mask)[0], dim=1)
+        out = self.projector_2(self.dropout(self.activation(self.projector_1(out))))
         return out
 
 
@@ -213,8 +222,11 @@ def main():
     parser.add_argument("--eval", action='store_true',
                         help="Whether to run eval on the test set.")
     parser.add_argument("--dataset_name", type=str)
-    parser.add_argument("--learning_rate", default=1e-4, type=float,
+    parser.add_argument("--learning_rate", default=5e-5, type=float,
                         help="The initial learning rate for Adam.")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=32,
+                        help="Number of updates steps to accumulate before performing a "
+                             "backward/update pass.")
     parser.add_argument("--weight_decay", default=1e-5, type=float,
                         help="Weight deay if we apply some.")
     parser.add_argument("--dataloader_workers", default=16, type=int)
@@ -273,15 +285,19 @@ def main():
             img_model.train()
             text_model.train()
             with tqdm(total=len(train_dataloader), ascii=True, leave=False, desc='iter') as pbar:
-                for i, (images, articles) in enumerate(train_dataloader):
+                for i, (images, articles_ids, articles_mask) in enumerate(train_dataloader):
                     itr += 1
-                    optimizer.zero_grad()
-                    image_projections = img_model(images.float().cuda())
-                    article_projections = text_model(articles.float().cuda())
-                    loss = triplet_loss(image_projections, article_projections)
 
-                    loss.backward()
-                    optimizer.step()
+                    image_projections = img_model(images.float().cuda())
+                    article_projections = text_model(articles_ids.cuda(), articles_mask.cuda())
+                    loss = triplet_loss(image_projections, article_projections)
+                    if args.gradient_accumulation_steps > 1:
+                        loss = loss / args.gradient_accumulation_steps
+
+                    if (i + 1) % args.gradient_accumulation_steps == 0:
+                        loss.backward()
+                        optimizer.step()
+                        optimizer.zero_grad()
                     if itr % 100 == 0:
                         mlflow.log_metric("training loss", loss.item() / max((len(
                             image_projections) * len(article_projections) - len(image_projections)), 1),
@@ -293,11 +309,13 @@ def main():
             losses = []
             with tqdm(total=len(test_dataloader), ascii=True, leave=False,
                       desc='eval') as pbar, torch.no_grad():
-                for i, (images, articles) in enumerate(test_dataloader):
+                for i, (images, articles_ids, articles_mask) in enumerate(test_dataloader):
                     with torch.no_grad():
                         image_projections = img_model(images.float().cuda())
-                        article_projections = text_model(articles.float().cuda())
+                        article_projections = text_model(articles_ids.cuda(), articles_mask.cuda())
                         loss = triplet_loss(image_projections, article_projections)
+                        if args.gradient_accumulation_steps > 1:
+                            loss = loss / args.gradient_accumulation_steps
 
                     losses.append(loss.item() / max(
                         (len(image_projections) * len(article_projections) - len(image_projections)),
